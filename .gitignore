@@ -22,7 +22,6 @@
 
 # Ignore logs and temporary files
 *.log
-*.txt
 
 # Ignore CMake generated files
 CMakeFiles/
