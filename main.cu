@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "kernel.cuh"
+
 #define CUDA_CHECK(call)                                                                                           \
     do                                                                                                             \
     {                                                                                                              \
@@ -31,6 +33,8 @@ const int batch_sizes[group_count] = {8192};
 const int m[group_count] = {32,64, 128};
 const int n[group_count] = {32,64, 128};
 const int k[group_count] = {32,64, 128};
+
+const int matrix_dim_global = 1024;
 
 using data_type = cuComplex;
 
@@ -67,6 +71,15 @@ int main()
     data_type **A[group_count], **B[group_count], **C[group_count];
     data_type **d_A[group_count], **d_B[group_count], **d_C[group_count];
     data_type **d_A_array[group_count], **d_B_array[group_count], **d_C_array[group_count];
+
+    data_type *d_A_global, *d_B_global, *d_C_global;
+
+    
+    CUDA_CHECK(cudaMalloc((void **)&d_A_global, sizeof(data_type) * matrix_dim_global * matrix_dim_global));
+    CUDA_CHECK(cudaMalloc((void **)&d_B_global, sizeof(data_type) * matrix_dim_global * matrix_dim_global));
+    CUDA_CHECK(cudaMalloc((void **)&d_C_global, sizeof(data_type) * matrix_dim_global * matrix_dim_global));
+
+
 
     for (int g = 0; g < group_count; g++)
     {
@@ -171,6 +184,12 @@ int main()
 
     for (int g = 0; g < group_count; g++)
     {
+
+        dim3 threads_scatter = dim3(32, 32);
+        dim3 blocks_scatter = dim3((m[g] + threads_scatter.x - 1) / threads_scatter.x, (k[g] + threads_scatter.y - 1) / threads_scatter.y, batch_sizes[g]);
+
+        matrix_scatter<<<blocks_scatter, threads_scatter, 0, streams[g]>>>(d_A_global, d_A_array[g], m[g], k[g], matrix_dim_global);
+
         CUBLAS_CHECK(cublasCgemmBatched(
             cublasH[g],
             CUBLAS_OP_N, CUBLAS_OP_N,
@@ -181,6 +200,11 @@ int main()
             &beta,
             d_C_array[g], m[g],
             batch_sizes[g]));
+
+        dim3 threads_gather = dim3(32, 32);
+        dim3 blocks_gather = dim3((m[g] + threads_gather.x - 1) / threads_gather.x, (n[g] + threads_gather.y - 1) / threads_gather.y, batch_sizes[g]);
+
+        matrix_gather<<<blocks_gather, threads_gather, 0, streams[g]>>>(d_C_global, d_C_array[g], m[g], n[g], matrix_dim_global);
     }
 
     cudaDeviceSynchronize();
