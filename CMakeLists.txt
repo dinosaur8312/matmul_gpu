@@ -7,7 +7,7 @@ set(CMAKE_VERBOSE_MAKEFILE ON)
 
 
 # Set the minimum required C++ standard
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # Find CUDA and cuBLAS

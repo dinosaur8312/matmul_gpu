@@ -3,6 +3,12 @@
 #include <cuComplex.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <tuple>
+#include <map>
 
 #include "kernel.cuh"
 
@@ -30,9 +36,9 @@
 
 const int group_count = 3;
 const int batch_sizes[group_count] = {8192};
-const int m[group_count] = {32,64, 128};
-const int n[group_count] = {32,64, 128};
-const int k[group_count] = {32,64, 128};
+const int m[group_count] = {32, 64, 128};
+const int n[group_count] = {32, 64, 128};
+const int k[group_count] = {32, 64, 128};
 
 const int matrix_dim_global = 1024;
 
@@ -63,8 +69,130 @@ void print_matrix(int rows, int cols, const data_type *matrix, int ld)
     }
 }
 
+std::vector<std::tuple<int, int, int>> parseMILFile(const std::string &filePath)
+{
+    std::vector<std::tuple<int, int, int>> parsedData;
+    std::ifstream file(filePath);
+    if (!file.is_open())
+    {
+        std::cerr << "Error: Unable to open file " << filePath << std::endl;
+        return parsedData;
+    }
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        std::istringstream lineStream(line);
+        std::string word;
+        std::vector<std::string> words;
+        while (lineStream >> word)
+        {
+            words.push_back(word);
+        }
+
+        // Check if the line has at least 7 elements (based on the given format)
+        if (words.size() >= 7)
+        {
+            int M = std::stoi(words[4]);
+            int N = std::stoi(words[5]);
+            int R = std::stoi(words[6]);
+            parsedData.emplace_back(M, N, R);
+        }
+    }
+
+    file.close();
+    return parsedData;
+}
+
+std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>>
+binByMultipleOf16(const std::vector<std::tuple<int, int, int>> &data)
+{
+    std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>> bins;
+
+    for (const auto &entry : data)
+    {
+        int M = std::get<0>(entry);
+        int N = std::get<1>(entry);
+        int R = std::get<2>(entry);
+
+        // Calculate the bin key
+        int binM = (M+15) / 16;
+        int binN = (N+15) / 16;
+        int binR = (R+15) / 16;
+        std::tuple<int, int, int> binKey = std::make_tuple(binM, binN, binR);
+
+        // Insert the entry into the appropriate bin
+        bins[binKey].emplace_back(M, N, R);
+    }
+
+    return bins;
+}
+
+// Helper function to print the bins
+void printBins(const std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>> &bins)
+{
+    for (const auto &[key, values] : bins)
+    {
+        std::cout << "Bin (" << std::get<0>(key) << ", " << std::get<1>(key) << ", " << std::get<2>(key) << "):\n";
+        for (const auto &value : values)
+        {
+            std::cout << "    M: " << std::get<0>(value)
+                      << ", N: " << std::get<1>(value)
+                      << ", R: " << std::get<2>(value) << "\n";
+        }
+    }
+}
+
+// Helper function to print the size of each bin
+void printBinsSize(const std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>> &bins) {
+    std::cout << "Bin Sizes:\n";
+    for (const auto &[key, values] : bins) {
+        std::cout << "Bin (" << std::get<0>(key)*16 << ", " << std::get<1>(key)*16 << ", " << std::get<2>(key)*16 << "): "
+                  << values.size() << " elements\n";
+    }
+}
+
+// Function to split the bins into two maps: R = 0 and R > 0
+std::pair<
+    std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>>,
+    std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>>>
+splitBins(const std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>> &bins) {
+    std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>> binsR0;
+    std::map<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>> binsRPositive;
+
+    for (const auto &[key, values] : bins) {
+        for (const auto &value : values) {
+            int R = std::get<2>(value);
+            if (R == 0) {
+                binsR0[key].emplace_back(value);
+            } else {
+                binsRPositive[key].emplace_back(value);
+            }
+        }
+    }
+
+    return {binsR0, binsRPositive};
+}
+
+
 int main()
 {
+
+    const std::string filePath = "MIL_Thread_combo_small.txt";
+    auto data = parseMILFile(filePath);
+     auto bins = binByMultipleOf16(data);
+    //printBins(bins);
+   // printBinsSize(bins);
+
+    auto [binsR0, binsRPositive] = splitBins(bins);
+
+    std::cout << "Bins with R = 0:\n";
+    printBinsSize(binsR0);
+
+    std::cout << "\nBins with R > 0:\n";
+    printBinsSize(binsRPositive);
+
+
     cublasHandle_t cublasH[group_count];
     cudaStream_t streams[group_count];
 
@@ -74,18 +202,15 @@ int main()
 
     data_type *d_A_global, *d_B_global, *d_C_global;
 
-    
     CUDA_CHECK(cudaMalloc((void **)&d_A_global, sizeof(data_type) * matrix_dim_global * matrix_dim_global));
     CUDA_CHECK(cudaMalloc((void **)&d_B_global, sizeof(data_type) * matrix_dim_global * matrix_dim_global));
     CUDA_CHECK(cudaMalloc((void **)&d_C_global, sizeof(data_type) * matrix_dim_global * matrix_dim_global));
-
-
 
     for (int g = 0; g < group_count; g++)
     {
         int batch_size = batch_sizes[g];
         int lm = m[g], ln = n[g], lk = k[g];
-        A[g] = new data_type *[batch_size]; 
+        A[g] = new data_type *[batch_size];
         B[g] = new data_type *[batch_size];
         C[g] = new data_type *[batch_size];
 
@@ -100,11 +225,11 @@ int main()
         initialize_matrix(B[g], lk, ln, batch_size);
     }
 
-    //print matrix
+    // print matrix
     /*
     for (int g = 0; g < group_count; g++)
     {
-        int batch_num =  batch_sizes[g];    
+        int batch_num =  batch_sizes[g];
         for (int i = 0; i < batch_num; i++)
         {
             printf("Group %d, Matrix %d:\n", g, i);
@@ -116,17 +241,15 @@ int main()
     const data_type alpha = make_cuComplex(1.f, 0.f);
     const data_type beta = make_cuComplex(0.f, 0.f);
 
-    
-
     for (int g = 0; g < group_count; g++)
     {
         CUDA_CHECK(cudaStreamCreate(&streams[g]));
         CUBLAS_CHECK(cublasCreate(&cublasH[g]));
         CUBLAS_CHECK(cublasSetStream(cublasH[g], streams[g]));
 
-        int batch_num =  batch_sizes[g];
+        int batch_num = batch_sizes[g];
 
-        //d_A, d_B, d_C are device pointers of size batch_num to store the device pointers of batch_num matrices
+        // d_A, d_B, d_C are device pointers of size batch_num to store the device pointers of batch_num matrices
 
         d_A[g] = new data_type *[batch_num];
         d_B[g] = new data_type *[batch_num];
@@ -142,34 +265,32 @@ int main()
             size_t B_size = sizeof(data_type) * k[g] * n[g];
             size_t C_size = sizeof(data_type) * m[g] * n[g];
 
-            CUDA_CHECK(cudaMalloc((void **)&d_A[g][i], sizeof(data_type ) * A_size));
-            CUDA_CHECK(cudaMalloc((void **)&d_B[g][i], sizeof(data_type ) * B_size));
-            CUDA_CHECK(cudaMalloc((void **)&d_C[g][i], sizeof(data_type ) * C_size));
-
+            CUDA_CHECK(cudaMalloc((void **)&d_A[g][i], sizeof(data_type) * A_size));
+            CUDA_CHECK(cudaMalloc((void **)&d_B[g][i], sizeof(data_type) * B_size));
+            CUDA_CHECK(cudaMalloc((void **)&d_C[g][i], sizeof(data_type) * C_size));
 
             CUDA_CHECK(cudaMemcpyAsync(d_A[g][i], A[g][i], A_size, cudaMemcpyHostToDevice, streams[g]));
             CUDA_CHECK(cudaMemcpyAsync(d_B[g][i], B[g][i], B_size, cudaMemcpyHostToDevice, streams[g]));
 
-            //d_Ai, d_Bi, d_Ci are device pointers, but in host memory. 
-            //CUDA_CHECK(cudaMemcpyAsync(&d_A[g][i], &d_Ai, sizeof(data_type *), cudaMemcpyHostToDevice, streams[g]));
-            //CUDA_CHECK(cudaMemcpyAsync(&d_B[g][i], &d_Bi, sizeof(data_type *), cudaMemcpyHostToDevice, streams[g]));
-            //CUDA_CHECK(cudaMemcpyAsync(&d_C[g][i], &d_Ci, sizeof(data_type *), cudaMemcpyHostToDevice, streams[g]));
+            // d_Ai, d_Bi, d_Ci are device pointers, but in host memory.
+            // CUDA_CHECK(cudaMemcpyAsync(&d_A[g][i], &d_Ai, sizeof(data_type *), cudaMemcpyHostToDevice, streams[g]));
+            // CUDA_CHECK(cudaMemcpyAsync(&d_B[g][i], &d_Bi, sizeof(data_type *), cudaMemcpyHostToDevice, streams[g]));
+            // CUDA_CHECK(cudaMemcpyAsync(&d_C[g][i], &d_Ci, sizeof(data_type *), cudaMemcpyHostToDevice, streams[g]));
 
-            //printf("Group %d, Matrix %d, d_Ci=%p, d_C[g]=%p\n", g, i, d_Ci, d_C[g]);
+            // printf("Group %d, Matrix %d, d_Ci=%p, d_C[g]=%p\n", g, i, d_Ci, d_C[g]);
 
-            //print d_A, A_B, d_C
-           // printf("Group %d, Matrix %d, d_A=%p, d_B=%p, d_C=%p\n", g, i, d_A[g][i], d_B[g][i], d_C[g][i]);
+            // print d_A, A_B, d_C
+            // printf("Group %d, Matrix %d, d_A=%p, d_B=%p, d_C=%p\n", g, i, d_A[g][i], d_B[g][i], d_C[g][i]);
         }
 
-        //copy d_A, d_B, d_C to device memory
+        // copy d_A, d_B, d_C to device memory
         CUDA_CHECK(cudaMemcpyAsync(d_A_array[g], d_A[g], sizeof(data_type *) * batch_num, cudaMemcpyHostToDevice, streams[g]));
         CUDA_CHECK(cudaMemcpyAsync(d_B_array[g], d_B[g], sizeof(data_type *) * batch_num, cudaMemcpyHostToDevice, streams[g]));
         CUDA_CHECK(cudaMemcpyAsync(d_C_array[g], d_C[g], sizeof(data_type *) * batch_num, cudaMemcpyHostToDevice, streams[g]));
 
-        //d_A, d_B, d_C are device pointers, but their inside values, such as d_C[g][i] are in device memory, which cannot be access directly in host code
+        // d_A, d_B, d_C are device pointers, but their inside values, such as d_C[g][i] are in device memory, which cannot be access directly in host code
     }
 
-    
     for (int g = 0; g < group_count; g++)
     {
         CUDA_CHECK(cudaStreamSynchronize(streams[g]));
@@ -180,7 +301,6 @@ int main()
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
     CUDA_CHECK(cudaEventRecord(start));
-
 
     for (int g = 0; g < group_count; g++)
     {
@@ -214,9 +334,9 @@ int main()
     float milliseconds = 0;
     CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
     printf("Time: %f ms\n", milliseconds);
-    //calculate GFLOPS
+    // calculate GFLOPS
     size_t total_flops = 0;
-    for(int g = 0; g < group_count; g++)
+    for (int g = 0; g < group_count; g++)
     {
         total_flops += 6 * m[g] * n[g] * k[g] * batch_sizes[g];
     }
@@ -224,7 +344,7 @@ int main()
     float gflop = total_flops / 1e9;
     printf("GFLOP: %f\n", total_flops / 1e9);
 
-    float gflops = gflop*1e3 / (milliseconds); 
+    float gflops = gflop * 1e3 / (milliseconds);
     printf("GFLOP/S: %f\n", gflops);
 
     /*
@@ -232,7 +352,7 @@ int main()
 
     for (int g = 0; g < group_count; g++)
     {
-        int batch_num =  batch_sizes[g];    
+        int batch_num =  batch_sizes[g];
         for (int i = 0; i < batch_num; i++)
         {
             printf("Group %d, Matrix %d:\n", g, i);
